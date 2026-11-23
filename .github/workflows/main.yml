@@ -1,0 +1,241 @@
+name: Auto Build Android APK from ZIP (3 Variants)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-apks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Detect & Extract Uploaded ZIP
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          LATEST_ZIP=$(find . -maxdepth 3 -type f -name "*.zip" -not -path "./.git/*" -printf "%T@ %p\n" | sort -nr | head -n 1 | cut -d' ' -f2- || true)
+          if [ -z "$LATEST_ZIP" ]; then
+            echo "No .zip file uploaded yet. Upload your app ZIP in the Code tab to start building."
+            echo "has_zip=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Found ZIP: $LATEST_ZIP"
+          WORK="/tmp/madrasa_work"
+          rm -rf "$WORK"
+          mkdir -p "$WORK"
+          unzip -qo "$LATEST_ZIP" -d "$WORK"
+
+          SETTINGS_FILE=$(find "$WORK" -type f -name "settings.gradle" | head -n 1 || true)
+          if [ -z "$SETTINGS_FILE" ]; then
+            echo "ERROR: Uploaded ZIP does not contain an Android project (settings.gradle not found)."
+            echo "Please upload madrasa-android-studio-ready.zip or madrasa-github-auto-builder.zip"
+            exit 1
+          fi
+
+          ANDROID_DIR=$(dirname "$SETTINGS_FILE")
+          echo "Android project root: $ANDROID_DIR"
+          echo "has_zip=true" >> $GITHUB_OUTPUT
+          echo "android_dir=$ANDROID_DIR" >> $GITHUB_OUTPUT
+
+      - name: Set up JDK 17
+        if: steps.detect.outputs.has_zip == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Node.js 20
+        if: steps.detect.outputs.has_zip == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Ensure 3 Build Variants (Debug, Standard Release, Hardened Release)
+        if: steps.detect.outputs.has_zip == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ADIR="${{ steps.detect.outputs.android_dir }}"
+          if ! grep -q "releaseHardened" "$ADIR/app/build.gradle"; then
+            cat > "$ADIR/app/build.gradle" << 'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+          android {
+              namespace 'com.madrasa.darululum.app'
+              compileSdk 34
+              defaultConfig {
+                  applicationId "com.madrasa.darululum.app"
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0.0"
+              }
+              buildFeatures {
+                  buildConfig true
+              }
+              signingConfigs {
+                  releaseSign {
+                      def ksPath = System.getenv("KEYSTORE_PATH")
+                      if (ksPath != null && new File(ksPath).exists()) {
+                          storeFile file(ksPath)
+                          storePassword System.getenv("KEYSTORE_PASSWORD") ?: "madrasa1234"
+                          keyAlias System.getenv("KEY_ALIAS") ?: "madrasa_key"
+                          keyPassword System.getenv("KEY_PASSWORD") ?: "madrasa1234"
+                      }
+                  }
+              }
+              buildTypes {
+                  debug {
+                      applicationIdSuffix ".debug"
+                      versionNameSuffix "-debug"
+                      debuggable true
+                      minifyEnabled false
+                      shrinkResources false
+                      buildConfigField "boolean", "ALLOW_WEBVIEW_DEBUG", "true"
+                  }
+                  releaseStandard {
+                      initWith release
+                      applicationIdSuffix ".std"
+                      versionNameSuffix "-standard"
+                      debuggable false
+                      minifyEnabled false
+                      shrinkResources false
+                      buildConfigField "boolean", "ALLOW_WEBVIEW_DEBUG", "false"
+                      signingConfig signingConfigs.releaseSign.storeFile != null ? signingConfigs.releaseSign : signingConfigs.debug
+                  }
+                  releaseHardened {
+                      initWith release
+                      versionNameSuffix "-hardened"
+                      debuggable false
+                      minifyEnabled true
+                      shrinkResources true
+                      buildConfigField "boolean", "ALLOW_WEBVIEW_DEBUG", "false"
+                      proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+                      signingConfig signingConfigs.releaseSign.storeFile != null ? signingConfigs.releaseSign : signingConfigs.debug
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          dependencies {
+              implementation 'androidx.appcompat:appcompat:1.7.0'
+              implementation 'androidx.webkit:webkit:1.11.0'
+          }
+          EOF
+
+            cat > "$ADIR/app/proguard-rules.pro" << 'EOF'
+          -keepclassmembers class com.madrasa.darululum.app.MainActivity$AndroidBridge {
+              @android.webkit.JavascriptInterface <methods>;
+          }
+          -repackageclasses 'o'
+          -allowaccessmodification
+          -optimizationpasses 5
+          EOF
+
+            mkdir -p "$ADIR/app/src/releaseHardened"
+            cat > "$ADIR/app/src/releaseHardened/AndroidManifest.xml" << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:tools="http://schemas.android.com/tools">
+              <application
+                  android:allowBackup="false"
+                  tools:replace="android:allowBackup" />
+          </manifest>
+          EOF
+          fi
+
+      - name: Prepare Release Signing Keystore
+        if: steps.detect.outputs.has_zip == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          KS_FILE="$RUNNER_TEMP/madrasa-release.jks"
+          keytool -genkeypair -v \
+            -keystore "$KS_FILE" \
+            -storepass "madrasa1234" \
+            -keypass "madrasa1234" \
+            -alias "madrasa_key" \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Madrasa Management, OU=IT, O=Madrasa, L=Dhaka, S=Dhaka, C=BD"
+          echo "KEYSTORE_PATH=$KS_FILE" >> $GITHUB_ENV
+          echo "KEYSTORE_PASSWORD=madrasa1234" >> $GITHUB_ENV
+          echo "KEY_ALIAS=madrasa_key" >> $GITHUB_ENV
+          echo "KEY_PASSWORD=madrasa1234" >> $GITHUB_ENV
+
+      - name: Setup Gradle 8.7
+        if: steps.detect.outputs.has_zip == 'true'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build 1 & 2 — Debug & Standard Release APKs
+        if: steps.detect.outputs.has_zip == 'true'
+        working-directory: ${{ steps.detect.outputs.android_dir }}
+        run: gradle assembleDebug assembleReleaseStandard --no-daemon
+
+      - name: Obfuscate & Minify Web Code for Hardened Release
+        if: steps.detect.outputs.has_zip == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --no-save terser javascript-obfuscator clean-css-cli html-minifier-terser
+          ASSETS="${{ steps.detect.outputs.android_dir }}/app/src/main/assets/public"
+          if [ -d "$ASSETS/js" ]; then
+            while IFS= read -r jsfile; do
+              npx terser "$jsfile" --module --compress drop_console=true,passes=2 --mangle -o "$jsfile.min"
+              npx javascript-obfuscator "$jsfile.min" --output "$jsfile" \
+                --compact true \
+                --control-flow-flattening false \
+                --string-array true \
+                --string-array-encoding base64 \
+                --rename-globals false \
+                --self-defending false
+              rm -f "$jsfile.min"
+            done < <(find "$ASSETS/js" -type f -name "*.js")
+          fi
+          if [ -d "$ASSETS/css" ]; then
+            while IFS= read -r cssfile; do
+              npx cleancss -o "$cssfile.min" "$cssfile" && mv "$cssfile.min" "$cssfile"
+            done < <(find "$ASSETS/css" -type f -name "*.css")
+          fi
+          if [ -f "$ASSETS/index.html" ]; then
+            npx html-minifier-terser --collapse-whitespace --remove-comments "$ASSETS/index.html" -o "$ASSETS/index.html.min"
+            mv "$ASSETS/index.html.min" "$ASSETS/index.html"
+          fi
+
+      - name: Build 3 — Hardened, Obfuscated & Smallest Release APK
+        if: steps.detect.outputs.has_zip == 'true'
+        working-directory: ${{ steps.detect.outputs.android_dir }}
+        run: gradle assembleReleaseHardened --no-daemon
+
+      - name: Collect All 3 APKs
+        if: steps.detect.outputs.has_zip == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ADIR="${{ steps.detect.outputs.android_dir }}"
+          OUT="$RUNNER_TEMP/apks-out"
+          mkdir -p "$OUT"
+          cp "$ADIR/app/build/outputs/apk/debug/app-debug.apk" "$OUT/1-madrasa-debug.apk"
+          cp "$ADIR/app/build/outputs/apk/releaseStandard/app-releaseStandard.apk" "$OUT/2-madrasa-release-standard.apk"
+          cp "$ADIR/app/build/outputs/apk/releaseHardened/app-releaseHardened.apk" "$OUT/3-madrasa-release-hardened.apk"
+          ls -lh "$OUT"/*.apk > "$OUT/BUILD_SUMMARY.txt"
+          cat "$OUT/BUILD_SUMMARY.txt"
+
+      - name: Deliver 3-APK ZIP in Actions Artifacts
+        if: steps.detect.outputs.has_zip == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: madrasa-android-apks-3-variants
+          path: ${{ runner.temp }}/apks-out/
+          retention-days: 30
