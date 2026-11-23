@@ -14,33 +14,56 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Detect & Extract Uploaded ZIP
+      - name: Detect & Extract Uploaded ZIPs (Android Base + Optional Latest Web ZIP)
         id: detect
         shell: bash
         run: |
           set -euo pipefail
-          LATEST_ZIP=$(find . -maxdepth 3 -type f -name "*.zip" -not -path "./.git/*" -printf "%T@ %p\n" | sort -nr | head -n 1 | cut -d' ' -f2- || true)
-          if [ -z "$LATEST_ZIP" ]; then
-            echo "No .zip file uploaded yet. Upload your app ZIP in the Code tab to start building."
+          mapfile -t ZIPS < <(find . -maxdepth 3 -type f -name "*.zip" -not -path "./.git/*" -printf "%T@ %p\n" | sort -nr | cut -d' ' -f2-)
+          if [ "${#ZIPS[@]}" -eq 0 ]; then
+            echo "No .zip file uploaded yet."
             echo "has_zip=false" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          echo "Found ZIP: $LATEST_ZIP"
-          WORK="/tmp/madrasa_work"
-          rm -rf "$WORK"
-          mkdir -p "$WORK"
-          unzip -qo "$LATEST_ZIP" -d "$WORK"
+          ANDROID_ZIP=""
+          LATEST_WEB_ZIP=""
+          for z in "${ZIPS[@]}"; do
+            if [ -z "$ANDROID_ZIP" ] && unzip -l "$z" | grep -q "settings.gradle"; then
+              ANDROID_ZIP="$z"
+            fi
+            if [ -z "$LATEST_WEB_ZIP" ] && unzip -l "$z" | grep -q "public/index.html"; then
+              LATEST_WEB_ZIP="$z"
+            fi
+          done
 
-          SETTINGS_FILE=$(find "$WORK" -type f -name "settings.gradle" | head -n 1 || true)
-          if [ -z "$SETTINGS_FILE" ]; then
-            echo "ERROR: Uploaded ZIP does not contain an Android project (settings.gradle not found)."
-            echo "Please upload madrasa-android-studio-ready.zip or madrasa-github-auto-builder.zip"
+          if [ -z "$ANDROID_ZIP" ]; then
+            echo "ERROR: No Android project ZIP (with settings.gradle) found in repository."
+            echo "Please upload madrasa-android-studio-ready.zip once in the Code tab."
             exit 1
           fi
 
+          WORK="/tmp/madrasa_work"
+          rm -rf "$WORK"
+          mkdir -p "$WORK/android_src"
+          echo "Using Android base ZIP: $ANDROID_ZIP"
+          unzip -qo "$ANDROID_ZIP" -d "$WORK/android_src"
+
+          SETTINGS_FILE=$(find "$WORK/android_src" -type f -name "settings.gradle" | head -n 1)
           ANDROID_DIR=$(dirname "$SETTINGS_FILE")
-          echo "Android project root: $ANDROID_DIR"
+
+          if [ -n "$LATEST_WEB_ZIP" ] && [ "$LATEST_WEB_ZIP" != "$ANDROID_ZIP" ]; then
+            echo "Merging latest web assets from: $LATEST_WEB_ZIP"
+            mkdir -p "$WORK/web_src"
+            unzip -qo "$LATEST_WEB_ZIP" -d "$WORK/web_src"
+            WEB_PUBLIC=$(find "$WORK/web_src" -type f -path "*/public/index.html" | head -n 1 | xargs -r dirname || true)
+            if [ -n "$WEB_PUBLIC" ]; then
+              rm -rf "$ANDROID_DIR/app/src/main/assets/public"
+              mkdir -p "$ANDROID_DIR/app/src/main/assets/public"
+              cp -a "$WEB_PUBLIC/." "$ANDROID_DIR/app/src/main/assets/public/"
+            fi
+          fi
+
           echo "has_zip=true" >> $GITHUB_OUTPUT
           echo "android_dir=$ANDROID_DIR" >> $GITHUB_OUTPUT
 
@@ -57,14 +80,14 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Ensure 3 Build Variants (Debug, Standard Release, Hardened Release)
+      - name: Configure 3 Build Variants & Fix Kotlin BOM Dependency
         if: steps.detect.outputs.has_zip == 'true'
         shell: bash
         run: |
           set -euo pipefail
           ADIR="${{ steps.detect.outputs.android_dir }}"
-          if ! grep -q "releaseHardened" "$ADIR/app/build.gradle"; then
-            cat > "$ADIR/app/build.gradle" << 'EOF'
+
+          cat << 'EOF' | sed 's/^          //' > "$ADIR/app/build.gradle"
           plugins {
               id 'com.android.application'
           }
@@ -128,12 +151,13 @@ jobs:
               }
           }
           dependencies {
+              implementation platform('org.jetbrains.kotlin:kotlin-bom:1.8.22')
               implementation 'androidx.appcompat:appcompat:1.7.0'
               implementation 'androidx.webkit:webkit:1.11.0'
           }
           EOF
 
-            cat > "$ADIR/app/proguard-rules.pro" << 'EOF'
+          cat << 'EOF' | sed 's/^          //' > "$ADIR/app/proguard-rules.pro"
           -keepclassmembers class com.madrasa.darululum.app.MainActivity$AndroidBridge {
               @android.webkit.JavascriptInterface <methods>;
           }
@@ -142,8 +166,8 @@ jobs:
           -optimizationpasses 5
           EOF
 
-            mkdir -p "$ADIR/app/src/releaseHardened"
-            cat > "$ADIR/app/src/releaseHardened/AndroidManifest.xml" << 'EOF'
+          mkdir -p "$ADIR/app/src/releaseHardened"
+          cat << 'EOF' | sed 's/^          //' > "$ADIR/app/src/releaseHardened/AndroidManifest.xml"
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android"
               xmlns:tools="http://schemas.android.com/tools">
@@ -152,7 +176,6 @@ jobs:
                   tools:replace="android:allowBackup" />
           </manifest>
           EOF
-          fi
 
       - name: Prepare Release Signing Keystore
         if: steps.detect.outputs.has_zip == 'true'
