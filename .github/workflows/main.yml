@@ -8,7 +8,7 @@ on:
 jobs:
   build-apks:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 40
 
     steps:
       - name: Checkout Repository
@@ -16,20 +16,18 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Detect Latest Uploaded ZIP (Supports Multiple v1, v2, v3... ZIPs)
+      - name: Detect Latest Uploaded ZIP
         id: detect
         shell: bash
         run: |
           set -euo pipefail
           TARGET_ZIP=""
 
-          # ১. এই কমিটে নতুন কোনো .zip আপলোড হয়ে থাকলে সরাসরি সেটাই নেবে
           COMMIT_ZIP=$(git diff-tree --no-commit-id --name-only --diff-filter=AM -r HEAD | grep -E '\.zip$' | sort -V | tail -n 1 || true)
           if [ -n "$COMMIT_ZIP" ] && [ -f "$COMMIT_ZIP" ] && unzip -l "$COMMIT_ZIP" | grep -q "settings.gradle"; then
             TARGET_ZIP="$COMMIT_ZIP"
           fi
 
-          # ২. না হলে রিপোর সব .zip-এর মধ্যে সর্বশেষ কমিট ও সর্বোচ্চ ভার্সন (v1, v2, v3...) নেবে
           if [ -z "$TARGET_ZIP" ]; then
             BEST_TS=0
             while IFS= read -r z; do
@@ -44,37 +42,50 @@ jobs:
           fi
 
           if [ -z "$TARGET_ZIP" ]; then
-            echo "No Android project ZIP found yet. Upload madrasa-app-v1.zip in Code tab."
+            echo "No Android project ZIP found yet."
             echo "has_zip=false" >> $GITHUB_OUTPUT
             exit 0
           fi
 
           echo "Building from latest ZIP: $TARGET_ZIP"
-          WORK="/tmp/madrasa_work"
+          WORK="$RUNNER_TEMP/madrasa_work"
           rm -rf "$WORK"
           mkdir -p "$WORK"
           unzip -qo "$TARGET_ZIP" -d "$WORK"
 
-          SETTINGS_FILE=$(find "$WORK" -type f -name "settings.gradle" | head -n 1)
+          # settings.gradle যে ফোল্ডারে আছে সেটাই android ফোল্ডার (node_modules বাদ)
+          SETTINGS_FILE=$(find "$WORK" -type f -name "settings.gradle" -not -path "*/node_modules/*" | head -n 1)
           ANDROID_DIR=$(dirname "$SETTINGS_FILE")
+          PROJECT_DIR=$(dirname "$ANDROID_DIR")
           ZIP_BASENAME=$(basename "$TARGET_ZIP" .zip)
 
           echo "has_zip=true" >> $GITHUB_OUTPUT
           echo "android_dir=$ANDROID_DIR" >> $GITHUB_OUTPUT
+          echo "project_dir=$PROJECT_DIR" >> $GITHUB_OUTPUT
           echo "zip_name=$ZIP_BASENAME" >> $GITHUB_OUTPUT
 
-      - name: Set up JDK 17
+      - name: Set up JDK 21
         if: steps.detect.outputs.has_zip == 'true'
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
-          java-version: '17'
+          java-version: '21'
 
-      - name: Set up Node.js 20
+      - name: Set up Node.js 22
         if: steps.detect.outputs.has_zip == 'true'
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
+
+      - name: Build web assets and sync into Android project
+        if: steps.detect.outputs.has_zip == 'true'
+        working-directory: ${{ steps.detect.outputs.project_dir }}
+        run: |
+          if [ -f package.json ]; then
+            npm ci
+            npm run build
+            npx --no-install cap sync android
+          fi
 
       - name: Prepare Release Signing Keystore
         if: steps.detect.outputs.has_zip == 'true'
@@ -94,52 +105,36 @@ jobs:
           echo "KEY_ALIAS=madrasa_key" >> $GITHUB_ENV
           echo "KEY_PASSWORD=madrasa1234" >> $GITHUB_ENV
 
-      - name: Setup Gradle 8.7
+      - name: Setup Gradle 8.11.1
         if: steps.detect.outputs.has_zip == 'true'
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.7'
+          gradle-version: '8.11.1'
 
       - name: Build 1 & 2 — Debug & Standard Release APKs
         if: steps.detect.outputs.has_zip == 'true'
         working-directory: ${{ steps.detect.outputs.android_dir }}
         run: gradle assembleDebug assembleReleaseStandard --no-daemon
 
-      - name: Obfuscate & Minify Web Code for Hardened Release
+      - name: Minify Web Code for Hardened Release
         if: steps.detect.outputs.has_zip == 'true'
         shell: bash
         run: |
           set -euo pipefail
-          npm install --no-save terser javascript-obfuscator clean-css-cli html-minifier-terser
+          npm install --no-save terser html-minifier-terser
           ASSETS="${{ steps.detect.outputs.android_dir }}/app/src/main/assets/public"
-
           if [ -d "$ASSETS/js" ]; then
             while IFS= read -r jsfile; do
-              MIN_JS="${jsfile%.js}.min.js"
-              npx terser "$jsfile" --module --compress drop_console=true,passes=2 --mangle -o "$MIN_JS"
-              npx javascript-obfuscator "$MIN_JS" --output "$jsfile" \
-                --compact true \
-                --control-flow-flattening false \
-                --string-array true \
-                --string-array-encoding base64 \
-                --rename-globals false \
-                --self-defending false
-              rm -f "$MIN_JS"
+              npx terser "$jsfile" --module --compress passes=2 --mangle -o "$jsfile.min"
+              mv "$jsfile.min" "$jsfile"
             done < <(find "$ASSETS/js" -type f -name "*.js")
           fi
-
-          if [ -d "$ASSETS/css" ]; then
-            while IFS= read -r cssfile; do
-              npx cleancss -o "$cssfile.min" "$cssfile" && mv "$cssfile.min" "$cssfile"
-            done < <(find "$ASSETS/css" -type f -name "*.css")
-          fi
-
           if [ -f "$ASSETS/index.html" ]; then
             npx html-minifier-terser --collapse-whitespace --remove-comments "$ASSETS/index.html" -o "$ASSETS/index.html.min"
             mv "$ASSETS/index.html.min" "$ASSETS/index.html"
           fi
 
-      - name: Build 3 — Hardened, Obfuscated & Smallest Release APK
+      - name: Build 3 — Hardened Release APK
         if: steps.detect.outputs.has_zip == 'true'
         working-directory: ${{ steps.detect.outputs.android_dir }}
         run: gradle assembleReleaseHardened --no-daemon
@@ -158,7 +153,7 @@ jobs:
           ls -lh "$OUT"/*.apk > "$OUT/BUILD_SUMMARY.txt"
           cat "$OUT/BUILD_SUMMARY.txt"
 
-      - name: Deliver 3-APK ZIP in Actions Artifacts
+      - name: Upload APKs
         if: steps.detect.outputs.has_zip == 'true'
         uses: actions/upload-artifact@v4
         with:
